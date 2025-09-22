@@ -1,39 +1,35 @@
 """
 Streamlit PoC — Venture Signal from GitHub Trending & arXiv (RSS)
------------------------------------------------------------------
-A quick proof‑of‑concept that pulls items from GitHub Trending and arXiv RSS feeds,
-then uses an LLM to summarize and produce a heuristic "Venture Signal" score.
+Robust version: timezone‑aware dates, safe sorting, optional per‑item LLM
+and global AI‑generated insights (topics, buzzwords, insights, notables).
 
-How to run locally
-------------------
-1) Create & activate a virtualenv (Python 3.10+ recommended).
-2) Install deps: `pip install -r requirements.txt` (see inline list below) or copy the minimal set:
-   feedparser, requests, pydantic, python-dateutil, pandas, streamlit, openai
-3) Run: `streamlit run app.py`
+How to run
+----------
+1) Create venv & install deps: `pip install -r requirements.txt`
+2) Put `main.py` and (optional) `logo.png` in the project root
+3) Run: `streamlit run main.py`
 
-Minimal requirements.txt
-------------------------
-feedparser
-requests
-pydantic
-python-dateutil
-pandas
-streamlit
-openai>=1.0.0
+Default feeds
+-------------
+- GitHub Trending (daily, all): https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml
+- arXiv quant-ph: https://rss.arxiv.org/atom/quant-ph
+- arXiv q-bio.QM: https://rss.arxiv.org/atom/q-bio.QM
+- arXiv stat.ML: https://rss.arxiv.org/atom/stat.ML
 
 Notes
 -----
-- The user will input their OpenAI API key directly from the sidebar (no need for env var).
-- Feeds used by default:
-  • GitHub Trending (daily, all languages): https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml
-  • arXiv: quant-ph, q-bio.QM, stat.ML
-- You can add more feeds in the sidebar.
+- Paste your OpenAI API key in the sidebar (LLM optional).
+- All date handling is timezone‑aware (UTC) to avoid naive/aware errors.
 """
 
+from __future__ import annotations
+
+import json
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable
 
 import feedparser
 import pandas as pd
@@ -50,7 +46,7 @@ except Exception:
     _OPENAI_AVAILABLE = False
 
 
-def get_openai_client(api_key: str):
+def get_openai_client(api_key: Optional[str]):
     if not _OPENAI_AVAILABLE:
         raise RuntimeError("openai package not installed. `pip install openai>=1.0.0`.")
     if not api_key:
@@ -64,7 +60,7 @@ class Item(BaseModel):
     title: str
     url: str
     source: str
-    published: Optional[datetime] = None
+    published: Optional[datetime] = None  # UTC aware
     summary_raw: str = ""
     tags: List[str] = Field(default_factory=list)
 
@@ -74,7 +70,29 @@ class Item(BaseModel):
     reasons: Optional[str] = None
 
 
-# --- Utilities ----------------------------------------------------------------
+# --- Time helpers ------------------------------------------------------------
+AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def to_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def parse_dt_aware_utc(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = dateparser.parse(s)
+        return to_aware_utc(dt) if dt else None
+    except Exception:
+        return None
+
+
+# --- Fetching & parsing ------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def fetch_feed(url: str, timeout: int = 15) -> Dict[str, Any]:
     resp = requests.get(url, timeout=timeout)
@@ -83,46 +101,20 @@ def fetch_feed(url: str, timeout: int = 15) -> Dict[str, Any]:
     return {"href": url, "feed": parsed}
 
 
-def _first_nonempty(*vals):
-    for v in vals:
-        if v:
-            return v
-    return ""
-
-
-def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        dt = dateparser.parse(s)
-        if dt is None:
-            return None
-        # Normalize to timezone-aware UTC
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-    try:
-        return dateparser.parse(s)
-    except Exception:
-        return None
-
-
 def normalize_entry(entry: Dict[str, Any], source: str) -> Item:
     link = entry.get("link") or entry.get("id") or ""
-    title = entry.get("title", "(no title)")
-    published = _parse_dt(_first_nonempty(entry.get("published"), entry.get("updated")))
-    summary = entry.get("summary", "")
+    title = (entry.get("title") or "(no title)").strip()
+    published = parse_dt_aware_utc(entry.get("published") or entry.get("updated"))
+    summary = entry.get("summary") or ""
 
-    tags = []
-    if "tags" in entry and entry["tags"]:
+    tags: List[str] = []
+    if entry.get("tags"):
         tags = [t.get("term") or t.get("label") or "" for t in entry["tags"]]
         tags = [t for t in tags if t]
 
     return Item(
         id=link or f"{source}:{hash(title)}",
-        title=title.strip(),
+        title=title,
         url=link,
         source=source,
         published=published,
@@ -151,6 +143,7 @@ def collect_items(feed_urls: Dict[str, List[str]], max_items_per_feed: int = 30)
             except Exception as e:
                 st.warning(f"Feed error: {e}")
 
+    # de-dup by url or title
     dedup: Dict[str, Item] = {}
     for it in items:
         key = it.url or f"{it.source}:{it.title}"
@@ -161,11 +154,15 @@ def collect_items(feed_urls: Dict[str, List[str]], max_items_per_feed: int = 30)
 
 # --- LLM prompts --------------------------------------------------------------
 VENTURE_PROMPT = (
-    "You are a venture analyst. Read the item (title, blurb) and produce:\n"
-    "1) a crisp 2-3 sentence summary for investors;\n"
-    "2) a Venture Signal score 0-100 (higher = more interesting for early-stage VC);\n"
-    "3) 2-4 short bullet reasons (market, timing, team/signal, traction, novelty).\n"
-    "Respond in JSON with keys: summary, score (int), reasons (array of strings)."
+   """You are a venture analyst. Read the item (title, blurb) and produce:
+"
+    "1) a crisp 2-3 sentence summary for investors;
+"
+    "2) a Venture Signal score 0-100 (higher = more interesting for early-stage VC);
+"
+    "3) 2-4 short bullet reasons (market, timing, team/signal, traction, novelty).
+"
+    "Respond in JSON with keys: summary, score (int), reasons (array of strings)."""
 )
 
 
@@ -187,7 +184,6 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
             response_format={"type": "json_object"},
         )
         text = chat.choices[0].message.content or "{}"
-        import json
         data = json.loads(text)
         item.summary_llm = data.get("summary")
         try:
@@ -202,11 +198,116 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
     return item
 
 
-# --- Streamlit UI -------------------------------------------------------------
-st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide")
+# --- Global AI insights with batching ----------------------------------------
+def chunked(seq: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
-st.image('logo.png', width=200)
-st.title("🚀 Venture Signal — GitHub Trending & arXiv (PoC)")
+
+def llm_batch_insights(client, model: str, items: List[Item], temperature: float = 0.2, batch_size: int = 60) -> Optional[dict]:
+    if not items:
+        return None
+
+    prompt = (
+        "You are a venture analyst. Read the JSON list of items (title, blurb, source, tags) and GENERATE data: "
+        "1) topics: array of {name, count} (3-8 items), with sensible topic names; "
+        "2) buzzwords: array of {term, count} (5-15 items); "
+        "3) insights: array of 3-6 bullets (<=20 words each, investor‑relevant); "
+        "4) notable_projects: array of {title, reason}; "
+        "5) notable_papers: array of {title, reason}; "
+        "Only use the provided content. Respond as strict JSON with those keys."
+    )
+
+    batches = []
+    for group in chunked(items[:240], batch_size):  # hard cap to avoid giant prompts
+        rows = [
+            {
+                "title": it.title,
+                "blurb": (it.summary_llm or it.summary_raw)[:400],
+                "source": it.source,
+                "tags": it.tags[:6],
+            }
+            for it in group
+        ]
+        corpus = json.dumps(rows, ensure_ascii=False)
+        try:
+            chat = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": corpus},
+                ],
+                response_format={"type": "json_object"},
+            )
+            d = json.loads(chat.choices[0].message.content or "{}")
+        except Exception as e:
+            st.warning(f"AI insights batch error: {e}")
+            d = {}
+        for k in ["topics", "buzzwords", "insights", "notable_projects", "notable_papers"]:
+            d.setdefault(k, [])
+        batches.append(d)
+
+    # aggregate
+    topics = defaultdict(int)
+    buzz = defaultdict(int)
+    insights: List[str] = []
+    projects: List[Dict[str, str]] = []
+    papers: List[Dict[str, str]] = []
+
+    for b in batches:
+        for t in b.get("topics", []):
+            name = str(t.get("name", "")).strip()
+            cnt = int(t.get("count", 0) or 0)
+            if name:
+                topics[name] += cnt
+        for z in b.get("buzzwords", []):
+            term = str(z.get("term", "")).strip().lower()
+            cnt = int(z.get("count", 0) or 0)
+            if term:
+                buzz[term] += cnt
+        insights.extend([str(x) for x in b.get("insights", [])])
+        projects.extend([{"title": str(x.get("title", "")), "reason": str(x.get("reason", ""))} for x in b.get("notable_projects", [])])
+        papers.extend([{"title": str(x.get("title", "")), "reason": str(x.get("reason", ""))} for x in b.get("notable_papers", [])])
+
+    # dedupe + trim
+    def dedupe_keep_order(seq: Iterable[str]) -> List[str]:
+        seen = set()
+        out = []
+        for s in seq:
+            if s not in seen and s:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    insights = dedupe_keep_order(insights)[:8]
+
+    topics_out = sorted(({"name": k, "count": v} for k, v in topics.items()), key=lambda x: x["count"], reverse=True)[:12]
+    buzz_out = sorted(({"term": k, "count": v} for k, v in buzz.items()), key=lambda x: x["count"], reverse=True)[:20]
+    projects = projects[:10]
+    papers = papers[:10]
+
+    return {
+        "topics": topics_out,
+        "buzzwords": buzz_out,
+        "insights": insights,
+        "notable_projects": projects,
+        "notable_papers": papers,
+    }
+
+
+# --- UI ----------------------------------------------------------------------
+st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide", page_icon="🚀")
+
+# Title with optional logo
+try:
+    col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
+    with col_logo:
+        st.image("logo.png", use_column_width=True)
+    with col_title:
+        st.markdown("# Venture Signal — GitHub Trending & arXiv (PoC)")
+except Exception:
+    st.title("🚀 Venture Signal — GitHub Trending & arXiv (PoC)")
 
 with st.sidebar:
     st.header("Settings")
@@ -214,7 +315,7 @@ with st.sidebar:
     model = st.text_input("OpenAI Model", value="gpt-4o-mini")
 
     st.header("Sources")
-    feed_urls = {
+    feed_urls: Dict[str, List[str]] = {
         "github_trending": ["https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml"],
         "arxiv": [
             "https://rss.arxiv.org/atom/quant-ph",
@@ -230,18 +331,22 @@ with st.sidebar:
 
     st.header("Filters")
     days_back = st.slider("Lookback window (days)", 1, 30, 7)
-    kw = st.text_input("Keyword filter (optional, regex supported)", value="")
+    kw = st.text_input("Keyword filter (regex ok)", value="")
 
     st.header("LLM")
-    llm_enabled = st.toggle("Use LLM to summarize & score", value=True)
+    llm_enabled = st.toggle("Use LLM to summarize & score (per item)", value=True)
+    insights_enabled = st.toggle("Generate global AI insights (topics, buzzwords, etc.)", value=True)
     max_items = st.slider("Max items per feed", 5, 50, 20)
     temp = st.slider("LLM temperature", 0.0, 1.0, 0.2, 0.1)
 
 # Fetch feeds
 items = collect_items(feed_urls, max_items_per_feed=max_items)
+
+# Filter by time
 lookback_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
 items = [it for it in items if (it.published is None or it.published >= lookback_dt)]
 
+# Filter by keyword
 if kw:
     try:
         regex = re.compile(kw, re.IGNORECASE)
@@ -250,16 +355,15 @@ if kw:
         st.warning("Invalid regex; skipping keyword filter.")
 
 st.write(f"Fetched {len(items)} items after filters.")
-items.sort(key=lambda x: x.published or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
+# Sort by recency safely (timestamp avoids tz issues entirely)
+items.sort(key=lambda x: (x.published or AWARE_MIN).timestamp(), reverse=True)
+
+# Per-item LLM annotation
+client = None
 if llm_enabled and items and api_key:
     try:
         client = get_openai_client(api_key)
-    except Exception as e:
-        st.error(str(e))
-        client = None
-
-    if client:
         annotate_progress = st.progress(0.0, text="Annotating with LLM…")
         out: List[Item] = []
         with ThreadPoolExecutor(max_workers=4) as ex:
@@ -273,15 +377,19 @@ if llm_enabled and items and api_key:
                 annotate_progress.progress(done / max(1, total), text=f"Annotating… {done}/{total}")
         items = out
         annotate_progress.empty()
+    except Exception as e:
+        st.error(str(e))
 
+# Ranking: venture_score first (desc), then recency
 items.sort(
     key=lambda x: (
         x.venture_score if x.venture_score is not None else -1,
-        x.published or datetime.min.replace(tzinfo=timezone.utc)
+        (x.published or AWARE_MIN).timestamp(),
     ),
-    reverse=True
+    reverse=True,
 )
 
+# Display results
 st.subheader("📊 Results")
 cols = st.columns([3, 2])
 
@@ -293,7 +401,7 @@ with cols[0]:
             if it.source:
                 meta.append(f"**Source:** {it.source}")
             if it.published:
-                meta.append(f"**Published:** {it.published.strftime('%Y-%m-%d %H:%M UTC')}")
+                meta.append(f"**Published (UTC):** {it.published.strftime('%Y-%m-%d %H:%M')}")
             if it.tags:
                 meta.append(f"**Tags:** {', '.join(it.tags[:8])}")
             st.caption(" · ".join(meta))
@@ -321,3 +429,61 @@ with cols[1]:
         for it in items
     ])
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+# --- AI-generated Insights ----------------------------------------------------
+st.subheader("🧠 AI‑generated insights (from RSS content)")
+if insights_enabled and api_key and items:
+    try:
+        client = client or get_openai_client(api_key)
+        ai = llm_batch_insights(client, model, items, temperature=temp)
+        if ai:
+            # Insights bullets
+            if ai.get("insights"):
+                st.markdown("#### Key insights")
+                for b in ai["insights"][:8]:
+                    st.write(f"• {b}")
+
+            # Topics chart
+            if ai.get("topics"):
+                st.markdown("#### Topics")
+                try:
+                    topics_df = pd.DataFrame(ai["topics"]).rename(columns={"name": "Topic", "count": "Count"})
+                    if not topics_df.empty:
+                        topics_df = topics_df.sort_values("Count", ascending=False)
+                        st.bar_chart(topics_df.set_index("Topic")["Count"], use_container_width=True)
+                except Exception:
+                    st.write(ai["topics"])  # fallback raw
+
+            # Buzzwords chart
+            if ai.get("buzzwords"):
+                st.markdown("#### Buzzwords")
+                try:
+                    buzz_df = pd.DataFrame(ai["buzzwords"]).rename(columns={"term": "Term", "count": "Count"})
+                    if not buzz_df.empty:
+                        buzz_df = buzz_df.sort_values("Count", ascending=False)
+                        st.bar_chart(buzz_df.set_index("Term")["Count"], use_container_width=True)
+                except Exception:
+                    st.write(ai["buzzwords"])  # fallback raw
+
+            # Notables
+            col_p, col_r = st.columns(2)
+            with col_p:
+                if ai.get("notable_projects"):
+                    st.markdown("#### Notable projects")
+                    for n in ai["notable_projects"][:10]:
+                        title = n.get("title", "(untitled)")
+                        reason = n.get("reason", "")
+                        st.write(f"- **{title}** — {reason}")
+            with col_r:
+                if ai.get("notable_papers"):
+                    st.markdown("#### Notable papers")
+                    for n in ai["notable_papers"][:10]:
+                        title = n.get("title", "(untitled)")
+                        reason = n.get("reason", "")
+                        st.write(f"- **{title}** — {reason}")
+        else:
+            st.caption("(No insights generated)")
+    except Exception as e:
+        st.warning(f"Insights error: {e}")
+else:
+    st.caption("Enable insights + LLM with an API key to generate global analytics.")
