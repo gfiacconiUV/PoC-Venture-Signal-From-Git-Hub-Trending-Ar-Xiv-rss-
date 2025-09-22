@@ -1,0 +1,7 @@
+feedparser
+requests
+pydantic
+python-dateutil
+pandas
+streamlit
+openai>=1.0.0
