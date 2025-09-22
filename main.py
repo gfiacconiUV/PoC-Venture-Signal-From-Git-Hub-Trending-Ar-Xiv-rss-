@@ -204,6 +204,8 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
 
 # --- Streamlit UI -------------------------------------------------------------
 st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide")
+
+st.image('logo.png', width=200)
 st.title("🚀 Venture Signal — GitHub Trending & arXiv (PoC)")
 
 with st.sidebar:
