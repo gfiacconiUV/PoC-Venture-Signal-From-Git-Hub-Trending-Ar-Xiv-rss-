@@ -285,8 +285,8 @@ except Exception:
 with st.sidebar:
     st.header("Settings")
     # Prefer secrets, fallback a input manuale
-    #api_key = st.secrets.get("api_key", None)
-    api_key = st.text_input("OpenAI API Key (opzionale)", type="password", value="api_key")
+    api_key = st.secrets.get("api_key", None)
+    #api_key = st.text_input("OpenAI API Key (opzionale)", type="password", value="api_key")
 
     model = st.selectbox(
         "OpenAI Model",
