@@ -291,7 +291,8 @@ with st.sidebar:
     model = st.selectbox(
         "OpenAI Model",
         options=[
-            "gpt-5",         # default
+            "gpt-5-nano",# default
+            "gpt-5",         
             "gpt-4.1",
             "gpt-4o",
             "gpt-4o-mini",
