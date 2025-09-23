@@ -321,7 +321,7 @@ st.markdown(
       }
     </style>
     <video id="bg-video" autoplay muted loop playsinline>
-      <source src="prova.mp4" type="video/mp4">
+      <source src="./prova.mp4" type="video/mp4">
     </video>
     <div class="bg-overlay"></div>
     """,
