@@ -1,27 +1,4 @@
-"""
-Streamlit PoC — Venture Signal from GitHub Trending & arXiv (RSS)
-Robust version: timezone‑aware dates, safe sorting, optional per‑item LLM
-and global AI‑generated insights (topics, buzzwords, insights, notables).
-
-How to run
-----------
-1) Create venv & install deps: `pip install -r requirements.txt`
-2) Put `main.py` and (optional) `logo.png` in the project root
-3) Run: `streamlit run main.py`
-
-Default feeds
--------------
-- GitHub Trending (daily, all): https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml
-- arXiv quant-ph: https://rss.arxiv.org/atom/quant-ph
-- arXiv q-bio.QM: https://rss.arxiv.org/atom/q-bio.QM
-- arXiv stat.ML: https://rss.arxiv.org/atom/stat.ML
-
-Notes
------
-- Paste your OpenAI API key in the sidebar (LLM optional).
-- All date handling is timezone‑aware (UTC) to avoid naive/aware errors.
-"""
-
+# main.py
 from __future__ import annotations
 
 import json
@@ -38,7 +15,7 @@ from dateutil import parser as dateparser
 from pydantic import BaseModel, Field
 import streamlit as st
 
-# --- LLM Client (OpenAI) -----------------------------------------------------
+# -------------------- LLM client (OpenAI) --------------------
 try:
     from openai import OpenAI
     _OPENAI_AVAILABLE = True
@@ -48,13 +25,13 @@ except Exception:
 
 def get_openai_client(api_key: Optional[str]):
     if not _OPENAI_AVAILABLE:
-        raise RuntimeError("openai package not installed. `pip install openai>=1.0.0`.")
+        raise RuntimeError("openai package non installato. `pip install openai>=1.0.0`.")
     if not api_key:
-        raise RuntimeError("Please enter your OpenAI API key in the sidebar.")
+        raise RuntimeError("Inserisci la tua OpenAI API key nella sidebar o in secrets.")
     return OpenAI(api_key=api_key)
 
 
-# --- Models ------------------------------------------------------------------
+# -------------------- Models --------------------
 class Item(BaseModel):
     id: str
     title: str
@@ -70,7 +47,7 @@ class Item(BaseModel):
     reasons: Optional[str] = None
 
 
-# --- Time helpers ------------------------------------------------------------
+# -------------------- Time helpers --------------------
 AWARE_MIN = datetime.min.replace(tzinfo=timezone.utc)
 
 
@@ -92,7 +69,7 @@ def parse_dt_aware_utc(s: Optional[str]) -> Optional[datetime]:
         return None
 
 
-# --- Fetching & parsing ------------------------------------------------------
+# -------------------- Fetching & parsing --------------------
 @st.cache_data(show_spinner=False)
 def fetch_feed(url: str, timeout: int = 15) -> Dict[str, Any]:
     resp = requests.get(url, timeout=timeout)
@@ -152,17 +129,13 @@ def collect_items(feed_urls: Dict[str, List[str]], max_items_per_feed: int = 30)
     return list(dedup.values())
 
 
-# --- LLM prompts --------------------------------------------------------------
+# -------------------- LLM prompts --------------------
 VENTURE_PROMPT = (
    """You are a venture analyst. Read the item (title, blurb) and produce:
-"
-    "1) a crisp 2-3 sentence summary for investors;
-"
-    "2) a Venture Signal score 0-100 (higher = more interesting for early-stage VC);
-"
-    "3) 2-4 short bullet reasons (market, timing, team/signal, traction, novelty).
-"
-    "Respond in JSON with keys: summary, score (int), reasons (array of strings)."""
+1) a crisp 2-3 sentence summary for investors;
+2) a Venture Signal score 0-100 (higher = more interesting for early-stage VC);
+3) 2-4 short bullet reasons (market, timing, team/signal, traction, novelty).
+Respond in JSON with keys: summary, score (int), reasons (array of strings)."""
 )
 
 
@@ -198,7 +171,7 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
     return item
 
 
-# --- Global AI insights with batching ----------------------------------------
+# -------------------- Global insights batching --------------------
 def chunked(seq: List[Any], size: int) -> Iterable[List[Any]]:
     for i in range(0, len(seq), size):
         yield seq[i:i+size]
@@ -210,16 +183,16 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
 
     prompt = (
         "You are a venture analyst. Read the JSON list of items (title, blurb, source, tags) and GENERATE data: "
-        "1) topics: array of {name, count} (3-8 items), with sensible topic names; "
+        "1) topics: array of {name, count} (3-8 items); "
         "2) buzzwords: array of {term, count} (5-15 items); "
-        "3) insights: array of 3-6 bullets (<=20 words each, investor‑relevant); "
+        "3) insights: array of 3-6 bullets (<=20 words each); "
         "4) notable_projects: array of {title, reason}; "
         "5) notable_papers: array of {title, reason}; "
-        "Only use the provided content. Respond as strict JSON with those keys."
+        "Only use the provided content. Respond as strict JSON."
     )
 
     batches = []
-    for group in chunked(items[:240], batch_size):  # hard cap to avoid giant prompts
+    for group in chunked(items[:240], batch_size):
         rows = [
             {
                 "title": it.title,
@@ -248,7 +221,6 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
             d.setdefault(k, [])
         batches.append(d)
 
-    # aggregate
     topics = defaultdict(int)
     buzz = defaultdict(int)
     insights: List[str] = []
@@ -270,7 +242,6 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
         projects.extend([{"title": str(x.get("title", "")), "reason": str(x.get("reason", ""))} for x in b.get("notable_projects", [])])
         papers.extend([{"title": str(x.get("title", "")), "reason": str(x.get("reason", ""))} for x in b.get("notable_papers", [])])
 
-    # dedupe + trim
     def dedupe_keep_order(seq: Iterable[str]) -> List[str]:
         seen = set()
         out = []
@@ -296,22 +267,85 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
     }
 
 
-# --- UI ----------------------------------------------------------------------
+# -------------------- UI --------------------
 st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide", page_icon="🚀")
-api_key = st.secrets["api_key"]
-# Title with optional logo
+
+# --- Background video + CSS theme ---
+st.markdown(
+    """
+    <style>
+      /* Reset padding of main container for edge-to-edge bg */
+      .stApp { background: transparent; }
+      /* Fullscreen background video */
+      #bg-video {
+        position: fixed; right: 0; bottom: 0; top: 0; left: 0;
+        width: 100%; height: 100%;
+        object-fit: cover; z-index: -2; filter: saturate(1.1) brightness(0.9);
+      }
+      /* Gradient overlay to improve contrast */
+      .bg-overlay {
+        position: fixed; inset: 0; z-index: -1;
+        background: radial-gradient(80% 60% at 50% 10%, rgba(0,0,0,0.15), rgba(0,0,0,0.55)),
+                    linear-gradient(to bottom, rgba(10,10,10,0.35), rgba(10,10,10,0.6));
+        backdrop-filter: blur(2px);
+      }
+      /* Glass panels */
+      .glass {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.15);
+        box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+        border-radius: 16px;
+        padding: 1rem 1.1rem;
+      }
+      /* Cards */
+      .card {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: 14px;
+        padding: 0.9rem 1rem;
+        margin-bottom: 0.8rem;
+      }
+      .meta { opacity: 0.85; font-size: 0.9rem; }
+      .score-badge {
+        display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px;
+        font-weight: 700; font-size: 0.85rem; letter-spacing: .3px;
+        background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.22);
+      }
+      .title-link { color: #fff; text-decoration: none; }
+      .title-link:hover { text-decoration: underline; }
+      /* Make sidebar translucent too */
+      section[data-testid="stSidebar"] {
+        background: rgba(15,15,20,0.50) !important;
+        backdrop-filter: blur(6px);
+        border-right: 1px solid rgba(255,255,255,0.12);
+      }
+    </style>
+    <video id="bg-video" autoplay muted loop playsinline>
+      <source src="prova.mp4" type="video/mp4">
+    </video>
+    <div class="bg-overlay"></div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Header / Hero ---
 try:
-    col_logo, col_title = st.columns([3, 9], vertical_alignment="center")
+    col_logo, col_title = st.columns([2, 10], vertical_alignment="center")
     with col_logo:
         st.image("logo.png", use_container_width=True)
     with col_title:
-        st.markdown("# Venture Signal — GitHub Trending & arXiv (PoC)")
+        st.markdown("<h1 style='margin: 0;'>Venture Signal — GitHub Trending & arXiv</h1>", unsafe_allow_html=True)
+        st.caption("Focus pulito, navigazione a tab, ranking chiaro, insights compatti.")
 except Exception:
-    st.title("🚀 Venture Signal — GitHub Trending & arXiv (PoC)")
+    st.title("🚀 Venture Signal — GitHub Trending & arXiv")
 
+# --- Sidebar ---
 with st.sidebar:
     st.header("Settings")
-    #api_key = st.text_input("OpenAI API Key", type="password")
+    # Prefer secrets, fallback a input manuale
+    api_key = st.secrets.get("api_key", None)
+    api_key = st.text_input("OpenAI API Key (opzionale)", type="password", value=api_key or "")
+
     model = st.text_input("OpenAI Model", value="gpt-4o-mini")
 
     st.header("Sources")
@@ -323,167 +357,172 @@ with st.sidebar:
             "https://rss.arxiv.org/atom/stat.ML",
         ],
     }
-
-    custom_feeds = st.text_area("Extra RSS/Atom feed URLs (one per line)", value="")
+    custom_feeds = st.text_area("Extra RSS/Atom (una per riga)")
     extra_urls = [u.strip() for u in custom_feeds.splitlines() if u.strip()]
     if extra_urls:
         feed_urls["custom"] = extra_urls
 
     st.header("Filters")
-    days_back = st.slider("Lookback window (days)", 1, 30, 7)
-    kw = st.text_input("Keyword filter (regex ok)", value="")
+    days_back = st.slider("Lookback (days)", 1, 30, 7)
+    kw = st.text_input("Filtro keyword/regex", value="")
 
     st.header("LLM")
-    llm_enabled = st.toggle("Use LLM to summarize & score (per item)", value=True)
-    insights_enabled = st.toggle("Generate global AI insights (topics, buzzwords, etc.)", value=True)
+    colA, colB = st.columns(2)
+    with colA:
+        llm_enabled = st.toggle("Annota per item", value=True)
+    with colB:
+        insights_enabled = st.toggle("Insights globali", value=True)
     max_items = st.slider("Max items per feed", 5, 50, 20)
-    temp = st.slider("LLM temperature", 0.0, 1.0, 0.2, 0.1)
+    temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
 
-# Fetch feeds
-items = collect_items(feed_urls, max_items_per_feed=max_items)
+# --- Main glass container ---
+with st.container():
+    st.markdown('<div class="glass">', unsafe_allow_html=True)
 
-# Filter by time
-lookback_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
-items = [it for it in items if (it.published is None or it.published >= lookback_dt)]
+    # Fetch + filter
+    items = collect_items(feed_urls, max_items_per_feed=max_items)
 
-# Filter by keyword
-if kw:
-    try:
-        regex = re.compile(kw, re.IGNORECASE)
-        items = [it for it in items if regex.search(it.title) or regex.search(it.summary_raw)]
-    except re.error:
-        st.warning("Invalid regex; skipping keyword filter.")
+    lookback_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
+    items = [it for it in items if (it.published is None or it.published >= lookback_dt)]
 
-st.write(f"Fetched {len(items)} items after filters.")
+    if kw:
+        try:
+            regex = re.compile(kw, re.IGNORECASE)
+            items = [it for it in items if regex.search(it.title) or regex.search(it.summary_raw)]
+        except re.error:
+            st.warning("Regex non valida; filtro ignorato.")
 
-# Sort by recency safely (timestamp avoids tz issues entirely)
-items.sort(key=lambda x: (x.published or AWARE_MIN).timestamp(), reverse=True)
+    # Sort by recency first (safe)
+    items.sort(key=lambda x: (x.published or AWARE_MIN).timestamp(), reverse=True)
 
-# Per-item LLM annotation
-client = None
-if llm_enabled and items and api_key:
-    try:
-        client = get_openai_client(api_key)
-        annotate_progress = st.progress(0.0, text="Annotating with LLM…")
-        out: List[Item] = []
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futs = {ex.submit(call_llm_annotate, client, model, it, temp): it for it in items}
-            total = len(futs)
-            done = 0
-            for fut in as_completed(futs):
-                result = fut.result()
-                out.append(result)
-                done += 1
-                annotate_progress.progress(done / max(1, total), text=f"Annotating… {done}/{total}")
-        items = out
-        annotate_progress.empty()
-    except Exception as e:
-        st.error(str(e))
+    # Per-item LLM
+    client = None
+    if llm_enabled and items and api_key:
+        try:
+            client = get_openai_client(api_key)
+            annotate_progress = st.progress(0.0, text="Annotazione LLM…")
+            out: List[Item] = []
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = {ex.submit(call_llm_annotate, client, model, it, temp): it for it in items}
+                total = len(futs)
+                done = 0
+                for fut in as_completed(futs):
+                    result = fut.result()
+                    out.append(result)
+                    done += 1
+                    annotate_progress.progress(done / max(1, total), text=f"Annotazione… {done}/{total}")
+            items = out
+            annotate_progress.empty()
+        except Exception as e:
+            st.error(str(e))
 
-# Ranking: venture_score first (desc), then recency
-items.sort(
-    key=lambda x: (
-        x.venture_score if x.venture_score is not None else -1,
-        (x.published or AWARE_MIN).timestamp(),
-    ),
-    reverse=True,
-)
+    # Ranking finale: score desc poi recency
+    items.sort(
+        key=lambda x: (
+            x.venture_score if x.venture_score is not None else -1,
+            (x.published or AWARE_MIN).timestamp(),
+        ),
+        reverse=True,
+    )
 
-# Display results
-st.subheader("📊 Results")
-cols = st.columns([3, 2])
+    # ---------------- Tabs Layout ----------------
+    tab_feed, tab_leaderboard, tab_insights = st.tabs(["📚 Feed", "🏆 Leaderboard", "🧠 Insights"])
 
-with cols[0]:
-    for it in items:
-        with st.container(border=True):
-            st.markdown(f"### [{it.title}]({it.url})")
-            meta = []
-            if it.source:
-                meta.append(f"**Source:** {it.source}")
-            if it.published:
-                meta.append(f"**Published (UTC):** {it.published.strftime('%Y-%m-%d %H:%M')}")
-            if it.tags:
-                meta.append(f"**Tags:** {', '.join(it.tags[:8])}")
-            st.caption(" · ".join(meta))
+    # FEED: card grid
+    with tab_feed:
+        st.caption(f"Items dopo filtri: **{len(items)}**")
+        # griglia a 3 colonne su desktop, 1-2 su mobile
+        cols = st.columns(3) if st.runtime.scriptrunner.script_run_context.get_script_run_ctx().session_info.browser.client_width > 1100 else st.columns(2)
+        if len(items) < 6:
+            cols = st.columns(1) if len(items) <= 2 else st.columns(2)
 
-            if it.summary_llm:
-                st.write(it.summary_llm)
-            else:
-                st.write(it.summary_raw[:600] + ("…" if len(it.summary_raw) > 600 else ""))
+        for idx, it in enumerate(items):
+            with cols[idx % len(cols)]:
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                title_md = f'<a class="title-link" href="{it.url}" target="_blank" rel="noopener">{it.title}</a>'
+                top_row = st.columns([8, 4])
+                with top_row[0]:
+                    st.markdown(f"### {title_md}", unsafe_allow_html=True)
+                with top_row[1]:
+                    if it.venture_score is not None:
+                        st.markdown(f'<div class="score-badge">Signal {it.venture_score}</div>', unsafe_allow_html=True)
+                meta_bits = []
+                if it.source:
+                    meta_bits.append(f"**Source:** {it.source}")
+                if it.published:
+                    meta_bits.append(f"**UTC:** {it.published.strftime('%Y-%m-%d %H:%M')}")
+                if it.tags:
+                    meta_bits.append(f"**Tags:** {', '.join(it.tags[:6])}")
+                st.markdown(f'<div class="meta">{" · ".join(meta_bits)}</div>', unsafe_allow_html=True)
 
-            if it.venture_score is not None:
-                st.metric(label="Venture Signal", value=it.venture_score)
-            if it.reasons:
-                with st.expander("Why it matters"):
-                    st.write(it.reasons)
+                st.write((it.summary_llm or it.summary_raw)[:650] + ("…" if len((it.summary_llm or it.summary_raw)) > 650 else ""))
 
-with cols[1]:
-    df = pd.DataFrame([
-        {
-            "title": it.title,
-            "source": it.source,
-            "published": it.published,
-            "score": it.venture_score,
-            "url": it.url,
-        }
-        for it in items
-    ])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+                if it.reasons:
+                    with st.expander("Why it matters"):
+                        st.write(it.reasons)
 
-# --- AI-generated Insights ----------------------------------------------------
-st.subheader("🧠 AI‑generated insights (from RSS content)")
-if insights_enabled and api_key and items:
-    try:
-        client = client or get_openai_client(api_key)
-        ai = llm_batch_insights(client, model, items, temperature=temp)
-        if ai:
-            # Insights bullets
-            if ai.get("insights"):
-                st.markdown("#### Key insights")
-                for b in ai["insights"][:8]:
-                    st.write(f"• {b}")
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            # Topics chart
-            if ai.get("topics"):
-                st.markdown("#### Topics")
-                try:
-                    topics_df = pd.DataFrame(ai["topics"]).rename(columns={"name": "Topic", "count": "Count"})
-                    if not topics_df.empty:
-                        topics_df = topics_df.sort_values("Count", ascending=False)
-                        st.bar_chart(topics_df.set_index("Topic")["Count"], use_container_width=True)
-                except Exception:
-                    st.write(ai["topics"])  # fallback raw
+    # LEADERBOARD: tabella compatta
+    with tab_leaderboard:
+        df = pd.DataFrame([
+            {
+                "Title": it.title,
+                "Score": it.venture_score,
+                "Source": it.source,
+                "Published (UTC)": it.published,
+                "URL": it.url,
+            }
+            for it in items
+        ])
+        # ordina per score disc poi data
+        df = df.sort_values(by=["Score", "Published (UTC)"], ascending=[False, False], na_position="last")
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # Buzzwords chart
-            if ai.get("buzzwords"):
-                st.markdown("#### Buzzwords")
-                try:
-                    buzz_df = pd.DataFrame(ai["buzzwords"]).rename(columns={"term": "Term", "count": "Count"})
-                    if not buzz_df.empty:
-                        buzz_df = buzz_df.sort_values("Count", ascending=False)
-                        st.bar_chart(buzz_df.set_index("Term")["Count"], use_container_width=True)
-                except Exception:
-                    st.write(ai["buzzwords"])  # fallback raw
+    # INSIGHTS: grafici + liste
+    with tab_insights:
+        if (insights_enabled and api_key and items):
+            try:
+                client = client or get_openai_client(api_key)
+                ai = llm_batch_insights(client, model, items, temperature=temp)
+                if ai:
+                    colA, colB = st.columns(2)
+                    with colA:
+                        if ai.get("topics"):
+                            st.markdown("#### Topics")
+                            topics_df = pd.DataFrame(ai["topics"]).rename(columns={"name": "Topic", "count": "Count"})
+                            if not topics_df.empty:
+                                topics_df = topics_df.sort_values("Count", ascending=False)
+                                st.bar_chart(topics_df.set_index("Topic")["Count"], use_container_width=True)
+                    with colB:
+                        if ai.get("buzzwords"):
+                            st.markdown("#### Buzzwords")
+                            buzz_df = pd.DataFrame(ai["buzzwords"]).rename(columns={"term": "Term", "count": "Count"})
+                            if not buzz_df.empty:
+                                buzz_df = buzz_df.sort_values("Count", ascending=False)
+                                st.bar_chart(buzz_df.set_index("Term")["Count"], use_container_width=True)
 
-            # Notables
-            col_p, col_r = st.columns(2)
-            with col_p:
-                if ai.get("notable_projects"):
-                    st.markdown("#### Notable projects")
-                    for n in ai["notable_projects"][:10]:
-                        title = n.get("title", "(untitled)")
-                        reason = n.get("reason", "")
-                        st.write(f"- **{title}** — {reason}")
-            with col_r:
-                if ai.get("notable_papers"):
-                    st.markdown("#### Notable papers")
-                    for n in ai["notable_papers"][:10]:
-                        title = n.get("title", "(untitled)")
-                        reason = n.get("reason", "")
-                        st.write(f"- **{title}** — {reason}")
+                    if ai.get("insights"):
+                        st.markdown("#### Key insights")
+                        for b in ai["insights"][:8]:
+                            st.write(f"• {b}")
+
+                    col_p, col_r = st.columns(2)
+                    with col_p:
+                        if ai.get("notable_projects"):
+                            st.markdown("#### Notable projects")
+                            for n in ai["notable_projects"][:10]:
+                                st.write(f"- **{n.get('title','(untitled)')}** — {n.get('reason','')}")
+                    with col_r:
+                        if ai.get("notable_papers"):
+                            st.markdown("#### Notable papers")
+                            for n in ai["notable_papers"][:10]:
+                                st.write(f"- **{n.get('title','(untitled)')}** — {n.get('reason','')}")
+                else:
+                    st.caption("(Nessun insight generato)")
+            except Exception as e:
+                st.warning(f"Insights error: {e}")
         else:
-            st.caption("(No insights generated)")
-    except Exception as e:
-        st.warning(f"Insights error: {e}")
-else:
-    st.caption("Enable insights + LLM with an API key to generate global analytics.")
+            st.caption("Abilita LLM + API key per generare gli insights.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
