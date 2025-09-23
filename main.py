@@ -139,7 +139,7 @@ Respond in JSON with keys: summary, score (int), reasons (array of strings)."""
 )
 
 
-def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) -> Item:
+def call_llm_annotate(client, model: str, item: Item) -> Item:
     content = (
         f"TITLE: {item.title}\n"
         f"BLURB: {item.summary_raw[:1200]}\n"
@@ -149,7 +149,6 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
     try:
         chat = client.chat.completions.create(
             model=model,
-            temperature=temperature,
             messages=[
                 {"role": "system", "content": VENTURE_PROMPT},
                 {"role": "user", "content": content},
@@ -177,7 +176,7 @@ def chunked(seq: List[Any], size: int) -> Iterable[List[Any]]:
         yield seq[i:i+size]
 
 
-def llm_batch_insights(client, model: str, items: List[Item], temperature: float = 0.2, batch_size: int = 60) -> Optional[dict]:
+def llm_batch_insights(client, model: str, items: List[Item], batch_size: int = 60) -> Optional[dict]:
     if not items:
         return None
 
@@ -206,7 +205,6 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
         try:
             chat = client.chat.completions.create(
                 model=model,
-                temperature=temperature,
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": corpus},
@@ -271,62 +269,7 @@ def llm_batch_insights(client, model: str, items: List[Item], temperature: float
 st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide", page_icon="🚀")
 
 # --- Background video + CSS theme ---
-st.markdown(
-    """
-    <style>
-      /* Reset padding of main container for edge-to-edge bg */
-      .stApp { background: transparent; }
-      /* Fullscreen background video */
-      #bg-video {
-        position: fixed; right: 0; bottom: 0; top: 0; left: 0;
-        width: 100%; height: 100%;
-        object-fit: cover; z-index: -2; filter: saturate(1.1) brightness(0.9);
-      }
-      /* Gradient overlay to improve contrast */
-      .bg-overlay {
-        position: fixed; inset: 0; z-index: -1;
-        background: radial-gradient(80% 60% at 50% 10%, rgba(0,0,0,0.15), rgba(0,0,0,0.55)),
-                    linear-gradient(to bottom, rgba(10,10,10,0.35), rgba(10,10,10,0.6));
-        backdrop-filter: blur(2px);
-      }
-      /* Glass panels */
-      .glass {
-        background: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        box-shadow: 0 8px 20px rgba(0,0,0,0.25);
-        border-radius: 16px;
-        padding: 1rem 1.1rem;
-      }
-      /* Cards */
-      .card {
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: 14px;
-        padding: 0.9rem 1rem;
-        margin-bottom: 0.8rem;
-      }
-      .meta { opacity: 0.85; font-size: 0.9rem; }
-      .score-badge {
-        display: inline-block; padding: 0.2rem 0.55rem; border-radius: 999px;
-        font-weight: 700; font-size: 0.85rem; letter-spacing: .3px;
-        background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.22);
-      }
-      .title-link { color: #fff; text-decoration: none; }
-      .title-link:hover { text-decoration: underline; }
-      /* Make sidebar translucent too */
-      section[data-testid="stSidebar"] {
-        background: rgba(15,15,20,0.50) !important;
-        backdrop-filter: blur(6px);
-        border-right: 1px solid rgba(255,255,255,0.12);
-      }
-    </style>
-    <video id="bg-video" autoplay muted loop playsinline>
-      <source src="./prova.mp4" type="video/mp4">
-    </video>
-    <div class="bg-overlay"></div>
-    """,
-    unsafe_allow_html=True,
-)
+
 
 # --- Header / Hero ---
 try:
@@ -334,8 +277,7 @@ try:
     with col_logo:
         st.image("logo.png", use_container_width=True)
     with col_title:
-        st.markdown("<h1 style='margin: 0;'>Venture Signal — GitHub Trending & arXiv</h1>", unsafe_allow_html=True)
-        st.caption("Focus pulito, navigazione a tab, ranking chiaro, insights compatti.")
+        st.markdown("<h1>Venture Signal — GitHub Trending & arXiv</h1>", unsafe_allow_html=True)
 except Exception:
     st.title("🚀 Venture Signal — GitHub Trending & arXiv")
 
@@ -343,10 +285,20 @@ except Exception:
 with st.sidebar:
     st.header("Settings")
     # Prefer secrets, fallback a input manuale
-    api_key = st.secrets.get("api_key", None)
-    api_key = st.text_input("OpenAI API Key (opzionale)", type="password", value=api_key or "")
+    #api_key = st.secrets.get("api_key", None)
+    api_key = st.text_input("OpenAI API Key (opzionale)", type="password", value="api_key")
 
-    model = st.text_input("OpenAI Model", value="gpt-4o-mini")
+    model = st.selectbox(
+        "OpenAI Model",
+        options=[
+            "gpt-5",         # default
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-3.5-turbo"
+        ],
+        index=0  # di default seleziona gpt-5
+    )
 
     st.header("Sources")
     feed_urls: Dict[str, List[str]] = {
@@ -373,7 +325,7 @@ with st.sidebar:
     with colB:
         insights_enabled = st.toggle("Insights globali", value=True)
     max_items = st.slider("Max items per feed", 5, 50, 20)
-    temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.1)
+    
 
 # --- Main glass container ---
 with st.container():
@@ -403,7 +355,7 @@ with st.container():
             annotate_progress = st.progress(0.0, text="Annotazione LLM…")
             out: List[Item] = []
             with ThreadPoolExecutor(max_workers=4) as ex:
-                futs = {ex.submit(call_llm_annotate, client, model, it, temp): it for it in items}
+                futs = {ex.submit(call_llm_annotate, client, model, it): it for it in items}
                 total = len(futs)
                 done = 0
                 for fut in as_completed(futs):
@@ -432,9 +384,16 @@ with st.container():
     with tab_feed:
         st.caption(f"Items dopo filtri: **{len(items)}**")
         # griglia a 3 colonne su desktop, 1-2 su mobile
-        cols = st.columns(3) if st.runtime.scriptrunner.script_run_context.get_script_run_ctx().session_info.browser.client_width > 1100 else st.columns(2)
-        if len(items) < 6:
-            cols = st.columns(1) if len(items) <= 2 else st.columns(2)
+        # Griglia senza API interne: scegli il numero di colonne in base a quanti item hai
+        def pick_cols(n_items: int) -> int:
+            if n_items >= 12:
+                return 3
+            if n_items >= 4:
+                return 2
+            return 1
+
+        ncols = pick_cols(len(items))
+        cols = st.columns(ncols)
 
         for idx, it in enumerate(items):
             with cols[idx % len(cols)]:
@@ -484,7 +443,7 @@ with st.container():
         if (insights_enabled and api_key and items):
             try:
                 client = client or get_openai_client(api_key)
-                ai = llm_batch_insights(client, model, items, temperature=temp)
+                ai = llm_batch_insights(client, model, items)
                 if ai:
                     colA, colB = st.columns(2)
                     with colA:
