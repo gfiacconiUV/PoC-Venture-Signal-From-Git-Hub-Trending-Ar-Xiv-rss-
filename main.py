@@ -64,10 +64,18 @@ class Item(BaseModel):
     summary_raw: str = ""
     tags: List[str] = Field(default_factory=list)
 
+    # Extra parsed metadata
+    authors: List[str] = Field(default_factory=list)            # arXiv authors
+    repo_owner: Optional[str] = None                            # GitHub owner handle
+
     # LLM-enriched fields
     summary_llm: Optional[str] = None
     venture_score: Optional[int] = None  # 0..100
     reasons: Optional[str] = None
+
+    # Enrichment results
+    owner_profile: Optional[Dict[str, Any]] = None              # from GitHub API
+    author_profiles: Dict[str, Dict[str, Any]] = Field(default_factory=dict)  # from OpenAlex
 
 
 # --- Time helpers ------------------------------------------------------------
@@ -94,6 +102,65 @@ def parse_dt_aware_utc(s: Optional[str]) -> Optional[datetime]:
 
 # --- Fetching & parsing ------------------------------------------------------
 @st.cache_data(show_spinner=False)
+def github_user(owner: str, token: Optional[str] = None, timeout: int = 15) -> Optional[Dict[str, Any]]:
+    if not owner:
+        return None
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = requests.get(f"https://api.github.com/users/{owner}", headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            j = r.json()
+            # Keep only useful fields
+            return {
+                "login": j.get("login"),
+                "name": j.get("name"),
+                "bio": j.get("bio"),
+                "company": j.get("company"),
+                "blog": j.get("blog"),
+                "location": j.get("location"),
+                "html_url": j.get("html_url"),
+                "followers": j.get("followers"),
+                "following": j.get("following"),
+            }
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def openalex_author(name: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
+    """Best-effort author lookup via OpenAlex (no key required)."""
+    if not name:
+        return None
+    try:
+        r = requests.get(
+            "https://api.openalex.org/authors",
+            params={"search": name, "per_page": 1},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get("results", [])
+            if results:
+                a = results[0]
+                return {
+                    "display_name": a.get("display_name"),
+                    "orcid": a.get("orcid"),
+                    "works_count": a.get("works_count"),
+                    "last_known_institution": (a.get("last_known_institution") or {}).get("display_name"),
+                    "ids": a.get("ids"),
+                    "openalex_url": a.get("id"),
+                    "homepage": (a.get("ids") or {}).get("wikipedia") or (a.get("ids") or {}).get("mag"),
+                }
+    except Exception:
+        return None
+    return None
+
+
+# --- Fetching & parsing ------------------------------------------------------
+@st.cache_data(show_spinner=False)
 def fetch_feed(url: str, timeout: int = 15) -> Dict[str, Any]:
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
@@ -112,8 +179,41 @@ def normalize_entry(entry: Dict[str, Any], source: str) -> Item:
         tags = [t.get("term") or t.get("label") or "" for t in entry["tags"]]
         tags = [t for t in tags if t]
 
+    # arXiv authors
+    authors: List[str] = []
+    if source == "arxiv" and entry.get("authors"):
+        try:
+            authors = [a.get("name") for a in entry["authors"] if a.get("name")]
+        except Exception:
+            authors = []
+
+    # GitHub repo owner (from link or title "owner/repo")
+    repo_owner: Optional[str] = None
+    if source == "github_trending":
+        # Try from link first
+        if "github.com/" in link:
+            try:
+                path = link.split("github.com/", 1)[1].strip("/")
+                repo_owner = path.split("/")[0]
+            except Exception:
+                repo_owner = None
+        if not repo_owner:
+            # Fallback from title like "owner / repo" or "owner/repo"
+            t = title.replace(" ", "")
+            if "/" in t:
+                repo_owner = t.split("/")[0]
+
     return Item(
         id=link or f"{source}:{hash(title)}",
+        title=title,
+        url=link,
+        source=source,
+        published=published,
+        summary_raw=summary,
+        tags=tags,
+        authors=authors,
+        repo_owner=repo_owner,
+    )}",
         title=title,
         url=link,
         source=source,
@@ -154,7 +254,7 @@ def collect_items(feed_urls: Dict[str, List[str]], max_items_per_feed: int = 30)
 
 # --- LLM prompts --------------------------------------------------------------
 VENTURE_PROMPT = (
-   """You are a venture analyst. Read the item (title, blurb) and produce:
+    """You are a venture analyst. Read the item (title, blurb) and produce:
 "
     "1) a crisp 2-3 sentence summary for investors;
 "
@@ -168,9 +268,12 @@ VENTURE_PROMPT = (
 
 def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) -> Item:
     content = (
-        f"TITLE: {item.title}\n"
-        f"BLURB: {item.summary_raw[:1200]}\n"
-        f"TAGS: {', '.join(item.tags) if item.tags else '-'}\n"
+        f"TITLE: {item.title}
+"
+        f"BLURB: {item.summary_raw[:1200]}
+"
+        f"TAGS: {', '.join(item.tags) if item.tags else '-'}
+"
         f"URL: {item.url}"
     )
     try:
@@ -192,7 +295,7 @@ def call_llm_annotate(client, model: str, item: Item, temperature: float = 0.2) 
             item.venture_score = None
         reasons = data.get("reasons")
         if isinstance(reasons, list):
-            item.reasons = "\n".join(f"• {r}" for r in reasons)
+            item.reasons = "".join(f"• {r}" for r in reasons)
     except Exception as e:
         item.summary_llm = f"LLM error: {e}"
     return item
@@ -303,7 +406,7 @@ st.set_page_config(page_title="Venture Signal — GitHub & arXiv", layout="wide"
 try:
     col_logo, col_title = st.columns([1, 8], vertical_alignment="center")
     with col_logo:
-        st.image("logo.png", use_column_width=True)
+        st.image("logo.png", use_container_width=True)
     with col_title:
         st.markdown("# Venture Signal — GitHub Trending & arXiv (PoC)")
 except Exception:
@@ -338,6 +441,10 @@ with st.sidebar:
     insights_enabled = st.toggle("Generate global AI insights (topics, buzzwords, etc.)", value=True)
     max_items = st.slider("Max items per feed", 5, 50, 20)
     temp = st.slider("LLM temperature", 0.0, 1.0, 0.2, 0.1)
+
+    st.header("Enrichment")
+    enrich_profiles = st.toggle("Enrich authors/owners with bios (OpenAlex + GitHub)", value=True)
+    gh_token = st.text_input("GitHub Token (optional, for higher rate limits)", type="password")
 
 # Fetch feeds
 items = collect_items(feed_urls, max_items_per_feed=max_items)
@@ -380,6 +487,21 @@ if llm_enabled and items and api_key:
     except Exception as e:
         st.error(str(e))
 
+# Optional enrichment: fetch bios for paper authors and repo owners
+if items and enrich_profiles:
+    with st.spinner("Enriching author/owner profiles…"):
+        for it in items:
+            # GitHub owner profile
+            if it.source == "github_trending" and it.repo_owner and not it.owner_profile:
+                it.owner_profile = github_user(it.repo_owner, token=gh_token)
+            # arXiv author profiles (best-effort, first hit)
+            if it.source == "arxiv" and it.authors and not it.author_profiles:
+                it.author_profiles = {}
+                for a in it.authors[:5]:  # cap per item
+                    prof = openalex_author(a)
+                    if prof:
+                        it.author_profiles[a] = prof
+
 # Ranking: venture_score first (desc), then recency
 items.sort(
     key=lambda x: (
@@ -405,6 +527,31 @@ with cols[0]:
             if it.tags:
                 meta.append(f"**Tags:** {', '.join(it.tags[:8])}")
             st.caption(" · ".join(meta))
+
+            # Enriched identities
+            if it.source == "arxiv" and it.authors:
+                st.markdown("**Authors**")
+                for a in it.authors:
+                    prof = (it.author_profiles or {}).get(a)
+                    if prof:
+                        line = f"- **{a}** — {prof.get('last_known_institution') or 'Affiliation N/A'}"
+                        if prof.get('openalex_url'):
+                            line += f"  · [OpenAlex]({prof['openalex_url']})"
+                        st.markdown(line)
+                    else:
+                        st.markdown(f"- **{a}**")
+
+            if it.source == "github_trending" and it.repo_owner:
+                st.markdown("**Repo owner**")
+                op = it.owner_profile or {}
+                owner_line = f"- **{op.get('name') or it.repo_owner}** (@{it.repo_owner})"
+                if op.get('company'):
+                    owner_line += f" — {op['company']}"
+                st.markdown(owner_line)
+                if op.get('bio'):
+                    st.caption(op['bio'])
+                if op.get('html_url'):
+                    st.caption(f"GitHub: {op['html_url']}")
 
             if it.summary_llm:
                 st.write(it.summary_llm)
